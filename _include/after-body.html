@@ -1,0 +1,79 @@
+<script type="module" src="assets/js/pyodide-cells.js"></script>
+<script>
+(function () {
+  var overlay = document.createElement('div');
+  overlay.id = 'diagram-lightbox';
+
+  var closeBtn = document.createElement('button');
+  closeBtn.id = 'diagram-lightbox-close';
+  closeBtn.innerHTML = '&times;';
+  closeBtn.setAttribute('aria-label', 'Close diagram');
+
+  var content = document.createElement('div');
+  content.id = 'diagram-lightbox-content';
+
+  overlay.appendChild(closeBtn);
+  overlay.appendChild(content);
+  document.body.appendChild(overlay);
+
+  function openLightbox(svgEl) {
+    content.innerHTML = svgEl.outerHTML;
+    var svg = content.querySelector('svg');
+    if (svg) {
+      svg.setAttribute('width', '100%');
+      svg.removeAttribute('height');
+      svg.style.removeProperty('max-width');
+      svg.style.display = 'block';
+    }
+    overlay.classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeLightbox() {
+    overlay.classList.remove('open');
+    document.body.style.overflow = '';
+  }
+
+  overlay.addEventListener('click', function (e) {
+    if (e.target === overlay || e.target === closeBtn) closeLightbox();
+  });
+  content.addEventListener('click', function (e) { e.stopPropagation(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closeLightbox();
+  });
+
+  function attachTo(svgEl) {
+    if (svgEl._lbAttached) return;
+    svgEl._lbAttached = true;
+    svgEl.style.cursor = 'zoom-in';
+    svgEl.addEventListener('click', function () { openLightbox(svgEl); });
+  }
+
+  function scanAndAttach() {
+    document.querySelectorAll('svg.mermaid-js').forEach(attachTo);
+  }
+
+  var observer = new MutationObserver(function (mutations) {
+    mutations.forEach(function (m) {
+      m.addedNodes.forEach(function (node) {
+        if (node.nodeType !== 1) return;
+        if (node.tagName.toLowerCase() === 'svg' && node.classList.contains('mermaid-js')) {
+          attachTo(node);
+        } else if (node.querySelectorAll) {
+          node.querySelectorAll('svg.mermaid-js').forEach(attachTo);
+        }
+      });
+    });
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () {
+      observer.observe(document.body, { childList: true, subtree: true });
+      scanAndAttach();
+    });
+  } else {
+    observer.observe(document.body, { childList: true, subtree: true });
+    scanAndAttach();
+  }
+})();
+</script>

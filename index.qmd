@@ -1,0 +1,39 @@
+---
+title: "Data Engineering for Spatial Systems"
+subtitle: "Databases, pipelines, and platforms for earth and place data at scale"
+---
+
+## What this book is for
+
+Spatial data does not sit still. Satellites produce imagery every day. Sensors stream readings every second. Weather models output grid fields every hour. Climate archives span decades. Urban sensor networks pulse continuously. The data exists. The question is whether you can move it, store it, query it, transform it, and serve it — reliably, at scale, under real conditions.
+
+This is data engineering. And spatial data engineering has specific requirements that generic data engineering books don't address: coordinate reference systems, spatial indexing, tiled raster formats, OGC standards, geographic query planning, and the particular challenges of time-series data that is also spatially structured.
+
+This book is built for engineers who need to solve these problems in practice.
+
+## Who this book is for
+
+Students in the Earth System Sciences and Data Engineeringand anyone building production pipelines. It assumes you know how to write Python and SQL. It also assumes you understand spatial data concepts — coordinate reference systems, vector and raster formats, map projections. If those are unfamiliar, [Computational Geography](https://wayward.house/learn/computational-geography/core/) Part 0 and Part 3 cover them.
+
+## How this book is structured
+
+Eight chapters. Each chapter ends with a "build this" section — a minimal, running implementation of the chapter's central concept. The eight components together form a small but real spatial data platform. Build all eight and you have built something.
+
+| Chapter | What you build |
+|---------|---------------|
+| Ch 1: Architecture | A data catalogue for a multi-source spatial project |
+| Ch 2: Spatial Databases | A PostGIS database with spatial queries and indexes |
+| Ch 3: Pipelines and ETL | A transformation pipeline from raw GeoJSON to normalised tables |
+| Ch 4: Cloud Infrastructure | A cloud-native GeoTIFF served from object storage with STAC metadata |
+| Ch 5: Streaming | A sensor data ingestion pipeline with a 5-minute aggregation |
+| Ch 6: APIs | A FastAPI service exposing a spatial query as an OGC-compatible endpoint |
+| Ch 7: Data Quality | A dbt project with spatial integrity tests |
+| Ch 8: ML Platform | A feature store and model serving endpoint for a spatial ML model |
+
+## What this book does not cover
+
+**GIS analysis.** Spatial analysis methods — viewsheds, cost-distance, spatial joins for analytical purposes — are covered in [Computational Geography](https://wayward.house/learn/computational-geography/core/).
+
+**Machine learning theory.** The models that the platforms in Ch 8 serve are designed and trained using the frameworks in [Mathematics for Data Science and AI](https://wayward.house/learn/data-ai/core/).
+
+**Vendor-specific cloud services.** The book uses open-source tooling throughout. Where AWS, GCP, or Azure are mentioned, open-source equivalents are always shown.

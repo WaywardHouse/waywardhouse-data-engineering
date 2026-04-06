@@ -1,0 +1,1208 @@
+---
+title: "Exercise Answers"
+subtitle: "Model answers and worked solutions"
+---
+
+This chapter provides model answers to all exercises in Chapters 1–8. Attempt each exercise before consulting this key. A model answer is not a ceiling — it is a floor. Good engineering thinking will extend beyond what is shown here.
+
+---
+
+## Chapter 1 — Data Architecture
+
+**1.1 — Format selection**
+
+**(a)** For the analytical store, use **GeoParquet** with Snappy or Zstd compression. The access pattern is selective: queries read a small number of columns (speed estimate, GPS point, timestamp) across large temporal ranges. A columnar format avoids reading vehicle count data when only speed is needed, and vice versa. GeoParquet also preserves the geometry column natively without a separate spatial index file. Row-oriented formats like GeoJSON or CSV require scanning every field in every row even for a single-column aggregation — at 30-second intervals from 500 sensors over 12 months, that is approximately 525 million rows.
+
+**(b)** A compound partition strategy of `year/month/region` minimises data read. The query specifies a time range (Q3 = months 7–9), a spatial constraint (northeast region), and a derived attribute (morning peak hours). A time-first compound partition eliminates all data outside Q3 before any spatial consideration. The region partition then eliminates the majority of the remaining data. No partition strategy eliminates the need to read morning peak records from within a partition, but that is a row-level filter applied after partition pruning, not a scan of the entire archive.
+
+A pure spatial partition (H3 or region only) would require reading all partitions to answer a time-bounded query. A pure time partition would require reading all Q3 partitions, including regions with no northeast data. The compound strategy exploits both dimensions.
+
+**(c)** Under the daily GeoJSON layout with one file per sensor: a query for one sensor over one week reads 7 files out of (500 sensors × 730 days) = 365,000 files. Fraction read: 7 / 365,000 ≈ 0.002%, but each file contains only one sensor's data for one day — so the query reads 100% of every file it opens. The problem is file proliferation, not selectivity within files.
+
+Under a time-partitioned GeoParquet layout (e.g., monthly partitions, all sensors in one file per partition): a one-week query spans 1–2 monthly partitions. Each partition file contains all 500 sensors. The query reads 1/500 of the rows within those partitions (if partitioned by time only) after a sensor ID filter. Columnar storage makes that filter cheap: only the sensor ID column is read to find matching row groups, then the requested columns are read for those groups. The data read fraction drops from "all bytes in 7 files" to "sensor ID column across 1–2 partitions, then selected columns in matching row groups."
+
+---
+
+**1.2 — Schema design**
+
+**(a)**
+
+```sql
+CREATE TABLE sst_observations (
+    observation_id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    acquired_at         TIMESTAMPTZ         NOT NULL,
+    satellite_id        VARCHAR(20)         NOT NULL,
+    instrument_id       VARCHAR(20)         NOT NULL,
+    temperature_c       REAL                NOT NULL,
+    quality_flag        SMALLINT            NOT NULL DEFAULT 0,
+    confidence_score    REAL                CHECK (confidence_score BETWEEN 0 AND 1),
+    geom                GEOMETRY(POINT, 4326) NOT NULL,
+    CONSTRAINT enforce_srid CHECK (ST_SRID(geom) = 4326)
+) PARTITION BY RANGE (acquired_at);
+```
+
+Index choices:
+- **GIST on `geom`**: required for any spatial query (`ST_DWithin`, `ST_Intersects`). Without it, every spatial query is a full table scan.
+- **B-tree on `acquired_at`**: almost every analytical query includes a time range. This index enables partition pruning and fast range scans within a partition.
+- **B-tree on `(satellite_id, acquired_at)`**: if queries frequently filter by satellite (e.g., comparing Aqua vs Terra retrievals over a time window), this composite index avoids scanning all satellites.
+- **No index on `quality_flag`**: low cardinality; a partial index (`WHERE quality_flag = 0`) is more useful if the majority of queries filter to high-quality records only.
+
+**(b)** At 200 million observations × 100 bytes per row: 200M × 100 = 20 GB per year uncompressed. With Zstd compression at a typical 4:1 ratio for numeric/geographic data: approximately 5 GB per year in storage.
+
+At this scale, annual partitioning by `acquired_at` is necessary rather than optional. A query for "SST anomalies in the Coral Sea in July 2021" should touch only the 2021 partition, not 20 years of data. At 5 GB/year, a 20-year archive is 100 GB compressed — manageable for a single PostgreSQL instance with partitioning, but only if partitions are pruned correctly. Without partitioning, a date-range query on 4 billion rows would require a full table scan even with a B-tree index, because the index pages themselves become large enough to cause I/O contention.
+
+**(c)** Adding `cloud_fraction` to a live analytical table should be done as a backward-compatible `ALTER TABLE`:
+
+```sql
+ALTER TABLE sst_observations
+    ADD COLUMN cloud_fraction REAL DEFAULT NULL;
+```
+
+A nullable column with no default, or a default of NULL, is backward compatible: existing queries that do not reference `cloud_fraction` are unaffected. Existing INSERT statements that do not supply `cloud_fraction` will write NULL for historical records.
+
+Steps for existing consumers: (1) update the data catalogue schema version from, say, 2 to 3, recording that `cloud_fraction REAL NULLABLE` was added in version 3; (2) notify pipeline maintainers so they can optionally start supplying the value; (3) backfill historical rows if the source data permits — run as a background job in batches to avoid table locks; (4) if the column will eventually be NOT NULL, add the constraint only after the backfill is verified complete, using `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` followed by `VALIDATE CONSTRAINT` in a separate transaction to avoid holding a lock.
+
+Do not add the column as NOT NULL without a default — this requires a table rewrite on large datasets in most PostgreSQL versions prior to 14.
+
+---
+
+**1.3 — Catalogue design**
+
+**(a)** The most important catalogue fields differ by dataset type:
+
+| Dataset | Critical fields |
+|---|---|
+| Roads network (GeoParquet, stable, monthly) | Schema version, update frequency, spatial extent, CRS, last updated date, file location |
+| Buildings footprint (GeoParquet, schema changed 3×) | Schema version history, change log per version, deprecation dates for old fields, migration notes |
+| Real-time sensor feed (PostGIS, 30-second updates) | Table name + connection string, refresh rate, retention window, staleness threshold for consumers |
+
+The roads and buildings datasets are file-based; their catalogue entries need to point to a specific file or partition path. The sensor feed is a live table; its entry needs connection information and a description of the temporal window available. Schema version history matters most for the buildings dataset, where three schema changes in two years means consumers need to know which version they were built against and what changed between versions. The real-time feed's catalogue entry needs to convey that "current" is a moving target and that historical data beyond the retention window does not exist.
+
+**(b)**
+
+```json
+{
+  "id": "buildings-footprint",
+  "current_schema_version": 3,
+  "schema_history": [
+    {
+      "version": 3,
+      "effective_from": "2024-06-01",
+      "changes": "Added height_m (REAL, nullable). Renamed toid to os_toid.",
+      "schema": {
+        "columns": [
+          {"name": "os_toid",    "type": "text",    "nullable": false},
+          {"name": "geom",       "type": "geometry","nullable": false},
+          {"name": "height_m",   "type": "real",    "nullable": true}
+        ]
+      }
+    },
+    {
+      "version": 2,
+      "effective_from": "2023-01-15",
+      "effective_to": "2024-05-31",
+      "changes": "Added confidence_score (REAL). Deprecated building_type.",
+      "schema": {
+        "columns": [
+          {"name": "toid",             "type": "text",  "nullable": false},
+          {"name": "geom",             "type": "geometry","nullable": false},
+          {"name": "confidence_score", "type": "real",  "nullable": true},
+          {"name": "building_type",    "type": "text",  "nullable": true,
+           "deprecated": true}
+        ]
+      }
+    },
+    {
+      "version": 1,
+      "effective_from": "2022-03-01",
+      "effective_to": "2023-01-14",
+      "changes": "Initial schema."
+    }
+  ]
+}
+```
+
+**(c)** A useful error message for a schema version mismatch would include:
+
+- The dataset ID and the version the pipeline expected (`expected_version: 2`)
+- The version currently recorded in the catalogue (`found_version: 3`)
+- The `effective_from` date of version 3 (so the maintainer knows when the change happened)
+- The diff between version 2 and version 3 (which columns were added, removed, or renamed)
+- A link to the catalogue entry or migration guide
+
+Without the diff, the maintainer knows there is a mismatch but not what changed. Without the effective date, they cannot determine whether the pipeline has been running against the wrong schema silently for days or months. A minimal useful message: `"Schema version mismatch for dataset 'buildings-footprint': expected v2, found v3 (effective 2024-06-01). Changes in v3: os_toid renamed from toid; height_m added. Update pipeline to use os_toid and handle nullable height_m."`
+
+---
+
+**1.4 — Partitioning trade-offs**
+
+**(a)** Assuming roughly uniform data distribution across ~2 million H3 level-5 cells and 5 years:
+
+| Partitioning strategy | Partitions opened for a single cell, single year |
+|---|---|
+| H3 cell only | 1 partition — contains all years for that cell |
+| Year only | 1 partition — contains all cells for that year |
+| Year then H3 cell | 1 partition — scoped to both year and cell |
+
+All three strategies open a single partition for a query targeting one cell and one year. The difference emerges when the query is less selective. A query asking for all cells in a region during one year benefits from year-first partitioning (eliminates 4/5 of data by year, then scans all cells within that year). A query asking for one cell across all years benefits from cell-first partitioning. Compound partitioning of year then H3 cell is optimal only when both dimensions are specified.
+
+**(b)** The two-pass filter works as follows. Pass 1 (index filter): the GIST index stores minimum bounding rectangles (MBRs) for each geometry. A spatial predicate like `ST_Intersects` first evaluates against MBRs, which is cheap. This returns a candidate set: all rows whose MBR intersects the query extent. Some of these candidates are false positives — their MBRs overlap the query extent but the actual geometries do not.
+
+Pass 2 (geometry refinement): for each candidate from pass 1, PostgreSQL evaluates the exact geometry predicate. This is expensive per row but is only applied to the candidate set, not the full table. The efficiency gain comes from the selectivity of pass 1: if the MBR filter reduces the candidate set from 50 million rows to 40,000, pass 2 performs 40,000 exact geometry tests rather than 50 million. A direct geometry comparison across all rows without the index would perform 50 million exact tests.
+
+The ratio of false positives to true positives (the false positive rate) depends on geometry complexity and query extent. Point geometries have no false positives because point MBRs are degenerate. Complex polygons with thin extensions can produce high false positive rates.
+
+**(c)** Over-partitioning creates many small files. The risks are:
+
+- **Metadata overhead**: the query planner must open and read the metadata (footer, statistics) of every partition to determine which ones to skip. With millions of tiny files, this metadata scan dominates query time.
+- **Object store request cost**: S3 and compatible stores charge per request. A query that opens 10,000 partitions incurs 10,000 LIST/GET requests, which can be slower and more expensive than reading fewer large files.
+- **Poor row group statistics**: a file with 1,000 rows has low statistical selectivity in its min/max statistics. The query engine cannot skip many row groups within the file, so the partition pruning benefit is reduced.
+
+A practical lower bound for cloud object storage is approximately 128 MB per file, with 256 MB to 1 GB being common guidance. At this size, metadata overhead is negligible relative to data read, and range requests can retrieve useful amounts of data per round trip.
+
+---
+
+## Chapter 2 — Spatial Databases
+
+**2.1 — Index mechanics**
+
+**(a)** The bounding-box pass returns approximately 0.8% of 5 million rows = **40,000 rows**. The GIST index identifies all rows whose bounding box overlaps the query's bounding box (derived from the DWithin radius). For point geometries, the bounding box of each point is degenerate (the point itself), so the false positive rate from bounding box expansion is low. The candidate set of ~40,000 is the input to pass 2.
+
+**(b)** If 15% of the 40,000 bounding-box candidates fail the exact `ST_DWithin` check, pass 2 examines all 40,000 rows but discards 6,000 of them. The geometry refinement therefore processes **40,000 rows** and returns 34,000.
+
+**(c)** From the EXPLAIN ANALYZE output: actual rows = 34,100, rows removed by filter = 6,200 — but this "rows removed" count reflects a sequential scan's filter, not the index-filtered pass 2. The filter removed 2,081,997 rows total, meaning the sequential scan examined approximately 2,116,097 rows to return 34,100. The false positive rate in the index sense is not directly readable from a Seq Scan — the Seq Scan output is telling us the index is *not being used*. This is consistent with the query plan showing "Seq Scan" rather than "Index Scan". The 6,200 figure in the question does not match the EXPLAIN output as written; the EXPLAIN shows "Rows Removed by Filter: 2,081,997" — meaning 98.3% of the table was scanned and discarded. There is no index in play here.
+
+**(d)** Adding `WHERE tile_id = 'SYD-042'` helps if: (i) there is a B-tree index on `tile_id`; (ii) the selectivity of `tile_id = 'SYD-042'` is high (i.e., few rows match); and (iii) the planner chooses to use the `tile_id` index first to reduce the candidate set before applying the spatial filter. This would allow a bitmap index scan on `tile_id` followed by a GIST index scan on `geom` — a combined approach.
+
+It does not help if: there is no index on `tile_id`; the `tile_id` values are not selective (many tiles per cell); or the query planner estimates the spatial filter is more selective and chooses to ignore the `tile_id` condition at the index level. In the central Sydney scenario, the spatial filter at 1 km radius is already fairly selective (0.8% of table), so adding `tile_id` only helps meaningfully if it reduces the candidate set further — which depends entirely on how fine-grained the tile scheme is.
+
+---
+
+**2.2 — PostGIS query design**
+
+**(a)** Fire stations within 10 km of a highway corridor, with distance and closest point:
+
+```sql
+-- Assumes:
+--   fire_stations(station_id, station_name, geom GEOMETRY(POINT, 4326))
+--   highway_corridors(corridor_id, geom GEOMETRY(LINESTRING, 4326))
+--   $1 is the corridor geometry (e.g., a specific LINESTRING)
+--
+-- ST_DWithin uses geography for metre-accurate distance on WGS84.
+-- ST_ClosestPoint returns the closest point on the corridor to each station.
+
+SELECT
+    fs.station_name,
+    ROUND(
+        ST_Distance(
+            fs.geom::geography,
+            $1::geography
+        )::numeric,
+        2
+    )                                           AS distance_m,
+    ST_ClosestPoint($1, fs.geom)               AS closest_point_on_corridor
+FROM fire_stations fs
+WHERE ST_DWithin(
+    fs.geom::geography,
+    $1::geography,
+    10000   -- 10 km in metres (geography uses metres)
+)
+ORDER BY distance_m;
+```
+
+**(b)** Total industrial parcel area per LGA:
+
+```sql
+-- ST_Area on geography type returns square metres; divide by 1e6 for km².
+-- The join uses ST_Intersects with containment logic: we join each parcel
+-- to the LGA whose geometry contains/overlaps the parcel centroid.
+-- Using centroid avoids double-counting parcels that straddle LGA boundaries.
+
+SELECT
+    l.lga_name,
+    ROUND(
+        SUM(
+            ST_Area(p.geom::geography) / 1e6
+        )::numeric,
+        4
+    ) AS industrial_area_km2
+FROM land_parcels p
+JOIN lgas l
+    ON ST_Intersects(ST_Centroid(p.geom), l.geom)
+WHERE p.classification = 'industrial'
+GROUP BY l.lga_name
+ORDER BY industrial_area_km2 DESC;
+```
+
+**(c)** Sensor readings within 500 m of an anomalous reading in the same 24-hour window:
+
+```sql
+WITH anomalous AS (
+    SELECT geom
+    FROM sensor_readings
+    WHERE is_anomalous = TRUE
+      AND recorded_at >= NOW() - INTERVAL '24 hours'
+)
+SELECT DISTINCT sr.reading_id,
+       sr.recorded_at,
+       sr.is_anomalous,
+       sr.geom
+FROM sensor_readings sr
+JOIN anomalous a
+    ON ST_DWithin(sr.geom::geography, a.geom::geography, 500)
+WHERE sr.recorded_at >= NOW() - INTERVAL '24 hours';
+```
+
+---
+
+**2.3 — Query plan interpretation**
+
+**(a)** "Seq Scan" means the query planner chose a full sequential table scan — reading every row in the table from disk — rather than using an index. This happens when: no suitable index exists; the planner estimates that more than roughly 5–10% of rows will be returned (making index traversal more expensive than a sequential scan); or statistics are stale and the planner's row estimate is wrong.
+
+**(b)** The filter examined 2,100,000 rows and returned 18,003. Ratio of work to useful output: 2,100,000 / 18,003 ≈ **117 rows examined per useful row**. Approximately 99.1% of all work was wasted. This is the operational signature of a missing spatial index: the query is doing the right work, but inefficiently.
+
+**(c)** For a 200 m radius query, a **GIST index on `geom`** provides more benefit. The spatial constraint is highly selective — only a small circle near one point — so the GIST index can eliminate almost all rows in pass 1. The `acquired_at` B-tree index would also help (by pruning the time range), but the spatial filter is so selective that adding spatial pruning first reduces the candidate set far more aggressively.
+
+For a country-wide extent query, the GIST index is far less selective (a large bounding box matches most of the dataset). In this case, the **B-tree index on `acquired_at`** provides more benefit: if the query also has a date range, the time filter may be far more selective than the spatial filter.
+
+Both indexes together allow the planner to combine them via a bitmap index AND: read the GIST bitmap, read the B-tree bitmap, AND the results to get the intersection.
+
+**(d)** After adding a GIST index, the planner may still choose a Seq Scan because: (1) **table statistics are stale** — run `ANALYZE spatial_observations` to update them; the planner estimates selectivity from statistics, and stale statistics can cause it to underestimate how selective the spatial filter is, making the index appear not worth using. (2) **The index exists on the parent table but not on partitions** — in a partitioned table, a GIST index on the parent does not automatically propagate to partitions in older PostgreSQL versions; check that the index exists on the specific partition being scanned.
+
+---
+
+**2.4 — CRS and projection**
+
+**(a)** PostGIS stores a spatial reference system ID (SRID) with every geometry. When a spatial join (`ST_Intersects`, `ST_Within`, etc.) is evaluated, PostGIS compares the coordinates mathematically, not geographically. NZTM2000 easting/northing values are in the range 1,000,000–2,100,000 (metres from a false origin). WGS84 longitude/latitude values are in the range −180 to +180 and −90 to +90. These coordinate ranges do not overlap numerically. The join computes whether NZTM2000 easting values (e.g., 1,748,000) fall within WGS84 bounding boxes (e.g., longitude 166 to 178), which they never do — so no rows match. PostGIS does not raise an error because it cannot detect this silently; it just finds no geometric intersection. The geometries exist in completely different coordinate spaces.
+
+**(b)**
+
+```sql
+-- Transform the global boundaries (EPSG:4326) to match the NZ parcels (EPSG:2193).
+-- Transform the smaller or less-indexed table where possible to preserve index use.
+
+SELECT
+    p.parcel_id,
+    a.admin_name
+FROM nz_parcels p
+JOIN global_admin a
+    ON ST_Intersects(
+        p.geom,
+        ST_Transform(a.geom, 2193)
+    );
+```
+
+Transform the global boundaries rather than the NZ parcels because: the NZ parcels table has a GIST index in EPSG:2193, which can be used in the join if the comparison geometry is also in EPSG:2193. Transforming the NZ parcels to EPSG:4326 would prevent the existing index from being used (a function wrapping a column disables index use for that column). `ST_Transform` on the join predicate is evaluated per-row but only on the global_admin side, which is likely smaller.
+
+**(c)** Compute area in EPSG:2193 (NZTM2000), **not** in EPSG:4326. Area computed in degrees is meaningless — it returns square-degree values that have no interpretable physical unit. NZTM2000 is a conformal projection designed for New Zealand that preserves area reasonably well for national-scale analysis. Compute area after the join, operating on geometries already in EPSG:2193:
+
+```sql
+ST_Area(p.geom) / 1e6  -- area in km² if geom is in EPSG:2193 (metres)
+```
+
+Do not use `ST_Area(geom::geography)` here — that cast would reproject to the geography type (using ellipsoidal calculations on WGS84), which is accurate but unnecessary if the data is already in a metric CRS.
+
+**(d)** In EPSG:4326, longitude wraps at ±180°. A feature crossing the antimeridian (e.g., a polygon in the Pacific crossing from +179° to −179°) has a bounding box that, naively computed, spans from −179° to +179° — nearly the entire globe. Spatial index operators compare bounding boxes, so this feature's MBR matches almost every query bounding box in the dataset. The GIST index becomes useless for that feature: it will appear as a candidate in every spatial query regardless of where the query is located, generating massive false positive rates and degrading query performance. The geometry test (pass 2) will discard most of these, but the overhead is substantial. Solutions include splitting antimeridian-crossing geometries at the antimeridian before storage, or storing in a projection centred on the Pacific (e.g., EPSG:3832) where the antimeridian is not near ±180°.
+
+---
+
+## Chapter 3 — Pipelines and ETL
+
+**3.1 — Schema validation**
+
+```python
+from __future__ import annotations
+
+from datetime import date
+from typing import Any
+
+KNOWN_PERMIT_TYPES = {"residential", "commercial", "industrial", "demolition", "temporary"}
+KNOWN_GEOMETRY_TYPES = {
+    "Point", "LineString", "Polygon",
+    "MultiPoint", "MultiLineString", "MultiPolygon", "GeometryCollection",
+}
+
+
+def validate_feature(feature: dict) -> list[str]:
+    """Return a list of validation errors for a GeoJSON Feature.
+
+    An empty list means the feature is valid.
+    """
+    errors: list[str] = []
+
+    # (a) Geometry check
+    geom = feature.get("geometry")
+    if geom is None:
+        errors.append("geometry: null")
+    elif not isinstance(geom, dict):
+        errors.append(f"geometry: expected dict, got {type(geom).__name__}")
+    elif geom.get("type") not in KNOWN_GEOMETRY_TYPES:
+        errors.append(f"geometry: unrecognised type {geom.get('type')!r}")
+
+    props = feature.get("properties") or {}
+
+    # (b) district_id: present, non-null, castable to int
+    district_id = props.get("district_id")
+    if district_id is None:
+        errors.append("district_id: missing or null")
+    else:
+        try:
+            int(district_id)
+        except (ValueError, TypeError):
+            errors.append(f"district_id: not castable to integer, got {district_id!r}")
+
+    # (c) issued_date: present, parseable as ISO 8601 date
+    issued_date = props.get("issued_date")
+    if issued_date is None:
+        errors.append("issued_date: missing or null")
+    else:
+        try:
+            date.fromisoformat(str(issued_date))
+        except (ValueError, TypeError):
+            errors.append(
+                f"issued_date: not a valid ISO 8601 date, got {issued_date!r}"
+            )
+
+    # (d) permit_type: present and from known set
+    permit_type = props.get("permit_type")
+    if permit_type is None:
+        errors.append("permit_type: missing or null")
+    elif permit_type not in KNOWN_PERMIT_TYPES:
+        errors.append(
+            f"permit_type: {permit_type!r} not in {sorted(KNOWN_PERMIT_TYPES)}"
+        )
+
+    return errors
+
+
+# ── Tests ──────────────────────────────────────────────────────────────────────
+
+def _make_valid_feature(**overrides) -> dict:
+    base = {
+        "type": "Feature",
+        "geometry": {"type": "Point", "coordinates": [151.2, -33.8]},
+        "properties": {
+            "district_id": "42",
+            "issued_date": "2024-03-15",
+            "permit_type": "residential",
+        },
+    }
+    if "properties" in overrides:
+        base["properties"].update(overrides.pop("properties"))
+    base.update(overrides)
+    return base
+
+
+def test_null_geometry():
+    f = _make_valid_feature(geometry=None)
+    errors = validate_feature(f)
+    assert any("geometry: null" in e for e in errors), errors
+
+
+def test_unknown_geometry_type():
+    f = _make_valid_feature(geometry={"type": "Cube", "coordinates": []})
+    errors = validate_feature(f)
+    assert any("unrecognised type" in e for e in errors), errors
+
+
+def test_non_integer_district_id():
+    f = _make_valid_feature(properties={"district_id": "twelve"})
+    errors = validate_feature(f)
+    assert any("district_id" in e and "not castable" in e for e in errors), errors
+
+
+def test_missing_issued_date():
+    f = _make_valid_feature(properties={"issued_date": None})
+    errors = validate_feature(f)
+    assert any("issued_date: missing or null" in e for e in errors), errors
+
+
+def test_invalid_date_format():
+    f = _make_valid_feature(properties={"issued_date": "15/03/2024"})
+    errors = validate_feature(f)
+    assert any("issued_date" in e and "ISO 8601" in e for e in errors), errors
+
+
+def test_unknown_permit_type():
+    f = _make_valid_feature(properties={"permit_type": "nuclear"})
+    errors = validate_feature(f)
+    assert any("permit_type" in e and "not in" in e for e in errors), errors
+
+
+def test_valid_feature_returns_empty_list():
+    f = _make_valid_feature()
+    assert validate_feature(f) == []
+
+
+if __name__ == "__main__":
+    for fn in [
+        test_null_geometry,
+        test_unknown_geometry_type,
+        test_non_integer_district_id,
+        test_missing_issued_date,
+        test_invalid_date_format,
+        test_unknown_permit_type,
+        test_valid_feature_returns_empty_list,
+    ]:
+        fn()
+        print(f"PASS: {fn.__name__}")
+```
+
+---
+
+**3.2 — Backlog arithmetic**
+
+**(a)** During the 8-hour campaign: arrival rate = 65 tiles/hour, processing rate = 50 tiles/hour, net accumulation = 15 tiles/hour. After 8 hours: backlog = 15 × 8 = **120 tiles**.
+
+**(b)** After the campaign, arrival rate drops to 40 tiles/hour, processing rate remains 50 tiles/hour. Net drain rate = 50 − 40 = 10 tiles/hour. Time to drain 120 tiles: 120 / 10 = **12 hours**.
+
+**(c)** The alert threshold is 200 tiles. At a net accumulation rate of 15 tiles/hour, the backlog reaches 200 tiles after 200 / 15 ≈ **13.3 hours** — but the campaign only lasts 8 hours, producing a maximum backlog of 120 tiles. The alert would **never fire** during this campaign because the peak backlog (120 tiles) does not reach the 200-tile threshold.
+
+This is an important operational observation: a threshold calibrated to "4 hours of processing time at 50 tiles/hour" actually represents a very large surge that this campaign does not produce. If the concern is the 12-hour drain time after the campaign, the threshold is set too high. A more sensitive threshold — say, 75 tiles (1.5 hours of processing time) — would fire at hour 5 of the campaign, giving operators early warning that a post-campaign drain period is building.
+
+---
+
+**3.3 — dbt model design**
+
+```sql
+-- models/permits/permits_validated.sql
+-- Validates and enriches permit records.
+-- Filters non-castable district_ids; joins to dim_districts;
+-- adds within_boundary flag from PostGIS ST_Within.
+
+with castable_permits as (
+    select
+        permit_id,
+        permit_type,
+        issued_date::date                               as issued_date,
+        geometry,
+        -- Filter: only keep rows where district_id is a non-null integer string.
+        -- The regex ^[0-9]+$ guards the cast; rows failing this are silently
+        -- excluded here and should be counted by a row count test downstream.
+        cast(district_id as integer)                   as district_id
+    from {{ ref('stg_permits') }}
+    where district_id is not null
+      and district_id ~ '^[0-9]+$'
+),
+
+joined as (
+    select
+        p.permit_id,
+        p.permit_type,
+        p.issued_date,
+        p.geometry,
+        d.district_id,
+        d.district_code,
+        d.district_name,
+        d.boundary,
+        ST_Within(p.geometry, d.boundary)              as within_boundary
+    from castable_permits p
+    inner join {{ ref('dim_districts') }} d
+        on p.district_id = d.district_id
+)
+
+select
+    permit_id,
+    permit_type,
+    issued_date,
+    district_id,
+    district_code,
+    district_name,
+    geometry,
+    within_boundary
+from joined
+```
+
+```yaml
+# models/permits/schema.yml
+version: 2
+
+models:
+  - name: permits_validated
+    description: >
+      Permit records joined to district dimension, with non-castable district_ids
+      excluded and a spatial within-boundary flag added.
+
+    columns:
+      - name: permit_id
+        description: Unique permit identifier from source system.
+        tests:
+          - not_null
+          - unique
+
+      - name: district_id
+        description: Integer district identifier, confirmed to exist in dim_districts.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_districts')
+              field: district_id
+
+      - name: district_code
+        description: Canonical district code from dim_districts.
+        tests:
+          - not_null
+
+      - name: permit_type
+        description: Permit classification.
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['residential', 'commercial', 'industrial', 'demolition', 'temporary']
+
+      - name: within_boundary
+        description: True if the permit geometry falls within the district boundary polygon.
+        tests:
+          - not_null
+```
+
+Three tests and their purposes: `unique` on `permit_id` detects upstream duplicate records or an erroneous join that fans out rows. `relationships` on `district_id` detects orphan district IDs — records that passed the integer cast but reference a district not in `dim_districts`. `accepted_values` on `permit_type` detects schema drift in the source's permit type enumeration.
+
+---
+
+**3.4 — Idempotency analysis**
+
+**(a) `DELETE WHERE run_date = today` then `INSERT`**: Not fully idempotent as written. If the pipeline fails between the DELETE and the INSERT, the table has no records for today — re-running will produce a correct result, but the intermediate state is incorrect (no data rather than stale data). If both operations are wrapped in a single transaction (`BEGIN; DELETE ...; INSERT ...; COMMIT;`), it becomes idempotent: either both operations commit or neither does, and re-running after failure will find no partial state to worry about.
+
+**(b) `INSERT ... SELECT ... WHERE id NOT IN (SELECT id FROM table)`**: Idempotent in intent but fragile in practice. The subquery checks for existing IDs before inserting — re-running after failure will skip already-inserted rows. However, `NOT IN` has a correctness issue: if `SELECT id FROM table` returns any NULLs, the `NOT IN` predicate evaluates to UNKNOWN for all rows, and nothing is inserted. Prefer `NOT EXISTS` or a left join pattern. With that caveat addressed, the pattern is functionally idempotent.
+
+**(c) Parquet append (read → concatenate → write back)**: Not idempotent. If the pipeline runs twice, the new records appear twice in the file — the second run reads the file that already contains the new records, concatenates them again, and writes a file with duplicates. To make it idempotent, deduplicate on a natural key before the write step, or use a keyed merge rather than a naive concatenate.
+
+**(d) Prefect flow that sends email after successful load**: Not idempotent in the notification dimension. Re-running the flow sends a second email. This is not a data correctness problem, but it is a side-effect problem. The fix depends on requirements: if duplicate notifications are acceptable (informational), no change is needed. If they are not acceptable (each email triggers an action), gate the email task with a check against a `runs_log` table that records whether a notification was already sent for this logical run. Alternatively, design the notification to be idempotent by nature (e.g., it sets a flag rather than sending an email — setting a flag twice has the same effect as setting it once).
+
+---
+
+## Chapter 4 — Cloud Infrastructure
+
+**4.1 — Object storage semantics**
+
+**(a) Rename `imagery/old_name.tif` to `imagery/new_name.tif`**: Not directly possible. S3-compatible stores have no rename operation. The equivalent is: copy the object to the new key (`CopyObject`), then delete the original (`DeleteObject`). This is not atomic — if the delete fails, both keys exist. For large objects, the copy is a server-side operation and does not transfer data over the network.
+
+**(b) Append 100 bytes to an existing object**: Not possible. Objects are immutable once written. The equivalent is: download the object, append the bytes in memory or a local file, then re-upload the entire object. For large objects, S3 Multipart Upload can be used to compose a new object from parts, but this does not modify the original — it creates a new object.
+
+**(c) List all objects whose keys begin with `imagery/2023/06/`**: Directly supported via `ListObjectsV2` with a `Prefix` parameter set to `imagery/2023/06/`. This is an efficient operation — no need to enumerate the entire bucket.
+
+**(d) Read bytes 10,000–20,000 without downloading the rest**: Directly supported via HTTP range requests. Set the `Range` header to `bytes=10000-19999` on a GET request. This is the mechanism COG readers use to fetch only the tiles and overviews they need.
+
+**(e) Create a directory called `imagery/2023/`**: Object stores have no directories — there is no operation to create one. A "directory" is a naming convention: any object whose key starts with `imagery/2023/` will appear under that prefix in a listing. To create the appearance of a directory, create a zero-byte object with the key `imagery/2023/` (this is what some tools do), or simply create any object under that prefix.
+
+---
+
+**4.2 — COG tile calculations**
+
+**(a)** The image covers 100 km × 100 km at 10 m resolution: 100,000 m / 10 m = 10,000 pixels per side. Total pixels: 10,000 × 10,000 = **100 million pixels**.
+
+**(b)** With 512 × 512 pixel tiles: 10,000 / 512 = 19.53, rounded up to 20 tiles per side (tiles at the edges are padded). Total tiles: 20 × 20 = **400 tiles**.
+
+**(c)** The AOI is 500 m × 500 m = 50 × 50 pixels. This fits within a single 512 × 512 tile. At minimum (best alignment, AOI falls entirely within one tile): **1 tile**. At maximum (worst alignment, AOI straddles a 2 × 2 tile boundary): **4 tiles**.
+
+**(d)** Native resolution: 200 MB. Overviews add 1/4 + 1/16 + 1/64 + 1/256 + ... ≈ 1/3 overhead (sum of the geometric series 1/(4^n) for n=1,2,...). Approximate total file size: 200 MB × (1 + 1/3) ≈ **267 MB** with overviews. DEFLATE compression on single-band imagery typically achieves 2:1 to 4:1 compression; at 3:1, the stored COG would be approximately 89 MB.
+
+---
+
+**4.3 — STAC Item design**
+
+**(a)** ID convention: `{survey_date}_{pilot_id}_{site_code}`, e.g., `20240815_P042_SITE-NW7`. The naming convention encodes the three dimensions most useful for searching: date, operator, and site. Avoid UUIDs as primary IDs in catalogues intended for human use — they are opaque and make debugging tedious.
+
+**(b)** The geometry should represent the **footprint of the orthomosaic** — the actual surveyed area at the ground. Use the convex hull of the survey area as a Polygon, or the tighter actual boundary if the flight path produces an irregular shape. Do not use a bounding box for the geometry field; it reduces search precision. The DSM has the same footprint, so the item geometry serves all assets.
+
+**(c)**
+
+```json
+"assets": {
+  "orthomosaic": {
+    "href": "s3://drone-surveys/2024/20240815_P042_SITE-NW7/ortho.tif",
+    "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+    "roles": ["data", "visual"],
+    "title": "RGB Orthomosaic (COG)"
+  },
+  "dsm": {
+    "href": "s3://drone-surveys/2024/20240815_P042_SITE-NW7/dsm.tif",
+    "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+    "roles": ["data"],
+    "title": "Digital Surface Model (COG)"
+  },
+  "gcps": {
+    "href": "s3://drone-surveys/2024/20240815_P042_SITE-NW7/gcps.csv",
+    "type": "text/csv",
+    "roles": ["metadata"],
+    "title": "Ground Control Points"
+  },
+  "flight_log": {
+    "href": "s3://drone-surveys/2024/20240815_P042_SITE-NW7/flight_log.json",
+    "type": "application/json",
+    "roles": ["metadata"],
+    "title": "Flight Log"
+  },
+  "thumbnail": {
+    "href": "s3://drone-surveys/2024/20240815_P042_SITE-NW7/thumbnail.jpg",
+    "type": "image/jpeg",
+    "roles": ["thumbnail"],
+    "title": "Preview"
+  }
+}
+```
+
+**(d)** Properties for search filtering:
+
+```json
+"properties": {
+  "datetime": "2024-08-15T09:42:00Z",
+  "gsd": 0.05,
+  "platform": "DJI Matrice 300 RTK",
+  "instruments": ["Zenmuse P1"],
+  "survey:site_code": "SITE-NW7",
+  "survey:pilot_id": "P042",
+  "eo:cloud_cover": 3,
+  "proj:epsg": 32755
+}
+```
+
+`gsd` (ground sampling distance in metres) is the most useful spatial quality filter — analysts need to know whether the imagery is sufficient resolution for their use. `proj:epsg` allows clients to filter surveys in a specific CRS without downloading the file. `eo:cloud_cover` enables quality filtering. `survey:site_code` enables site-based search for repeated surveys of the same location.
+
+---
+
+**4.4 — Partitioning strategy**
+
+**(a)** For access pattern (1) — multi-year time series for a specific region — partition first by region (tile identifier or spatial grid cell), then by date:
+
+```
+modis/region={h12v04}/year={2021}/doy={001}/MOD09GA.A2021001.h12v04.006.tif
+```
+
+A researcher requesting all data for `h12v04` from 2015–2023 can issue a single `ListObjectsV2` with prefix `modis/region=h12v04/` and then filter by year. The region dimension is in the outermost partition level, so all relevant data is co-located.
+
+**(b)** For access pattern (2) — operational monitoring of the past 30 days for a regional subset — partition first by date, then by region:
+
+```
+modis/year={2024}/month={03}/day={15}/region={h12v04}/MOD09GA.A2024074.h12v04.006.tif
+```
+
+The operational system reads the most recent 30 days across a fixed set of regions. Date-first partitioning lets it list the last 30 daily prefixes efficiently; the region dimension filters within each day's prefix.
+
+**(c)** Both structures cannot exist simultaneously in a flat object store — the archive can only have one physical layout. The solution is to serve both patterns from the **same canonical archive** (choose one layout, e.g., date-first) and provide a **STAC catalogue** as the access layer. The STAC API serves both access patterns via its search endpoint: researchers query `POST /search` with a `bbox` and `datetime` range; the STAC index returns item URLs regardless of the underlying storage layout. The object keys themselves are never exposed to the research consumer — they interact with STAC items that contain `href` links.
+
+Alternatively, a **second layer of manifests or inventory lists** (S3 Inventory or STAC static catalogue files) can provide region-indexed lookup into a date-partitioned archive without duplicating the data.
+
+---
+
+## Chapter 5 — Streaming and Realtime
+
+**5.1 — Latency budget**
+
+**(a)** Realistic latency budget for an 8-minute end-to-end requirement:
+
+| Component | Estimated latency | Notes |
+|---|---|---|
+| Sensor sampling interval | 30 s | Sensor reports every 30 seconds; worst case is reading taken just before the fire |
+| Cellular transmission | 10–30 s (median 15 s) | Dependent on signal; rural areas may spike to 90 s |
+| Kafka ingestion + broker | 1–2 s | Message written to topic, acknowledged |
+| Stream processing (Faust/Flink) | 1–5 s | Window evaluation; depends on window type and watermark lag |
+| Windowing lag | 60–120 s | Tumbling window must close before result is emitted |
+| Alert evaluation | 1–2 s | Threshold check against window mean |
+| Notification delivery | 5–15 s | Push notification or SMS; dependent on carrier |
+| **Total (median path)** | **~3.5–4 min** | Comfortable within 8 min budget |
+| **Total (slow path, 90th percentile)** | **~6–7 min** | Approaching the budget limit |
+
+**(b)** If the fixed components are: sensor sampling 30 s, transmission 90 s (slow path), ingestion 2 s, alert evaluation 2 s, notification 15 s — total fixed = 139 s ≈ 2.3 minutes. Remaining budget: 8 minutes − 2.3 minutes = **5.7 minutes maximum windowing lag**. In practice a safety margin of 1–2 minutes is advisable, so the practical maximum is ~4 minutes.
+
+**(c)** With up to 3 minutes of transmission lag, events can arrive at the stream processor up to 3 minutes after their event time. The watermark should be set to lag behind the stream's maximum observed event time by at least the maximum transmission lag: **watermark lag = 3 minutes**. This means a tumbling window for period [T, T+5min] will not close until 8 minutes have elapsed in processing time — the window waits 3 minutes after T+5min to ensure late-arriving events from within the window have had time to arrive. Records arriving more than 3 minutes late are treated as late and may be dropped or routed to a side output.
+
+---
+
+**5.2 — Partition key selection**
+
+**(a)**
+
+| Strategy | Ordering guarantee | Throughput implication |
+|---|---|---|
+| Sensor ID | All messages from one sensor are ordered within one partition | With 500 sensors and 20 partitions, ~25 sensors share each partition. Ordering within a sensor is guaranteed; ordering across sensors is not. Load is even if sensor activity is uniform. |
+| Geographic region | All messages from one region are ordered within one partition | With 20 regions and 20 partitions, each region gets one partition. Ordering within a region is guaranteed. Load depends on region activity, which may be uneven. |
+| Hash of sensor ID mod 20 | No per-sensor ordering guarantee; messages from the same sensor may go to different partitions over time | Even distribution across partitions; no ordering property. |
+
+**(b)** For a consumer computing per-region aggregates, use **geographic region as the partition key**. All messages for a given region arrive at a single partition, so the consumer can maintain per-region state in memory without cross-partition coordination. Each consumer process can handle one or more complete regions, and the aggregation state for a region never needs to be merged across consumers.
+
+**(c)** Cross-region correlations require data from multiple regions to be co-located in the same processing context. With region-based partitioning, region A's data and region B's data are in different partitions and potentially on different consumers. To compute cross-region correlations, you need either: (i) a separate aggregation step that reads from all region-aggregate output topics and merges them; or (ii) a different architecture — a consumer that reads all partitions (single-consumer group with one member) or a stateful stream join across regions. The region partition key remains useful for the per-region aggregation step; the cross-region step is a second-tier join over the already-aggregated outputs.
+
+---
+
+**5.3 — Watermark policy**
+
+**(a)** For a 5-minute tumbling window dashboard, the relevant statistic is: 95% of readings arrive within 2 minutes. A watermark lag of **2 minutes** means only the slowest 5% of records will be late-dropped. The fraction dropped is approximately 5%, though in practice it is lower because many of the "late" records arrive at 2:01 or 2:05, not 8 hours late — the 5% figure includes records that are only slightly past the 2-minute mark.
+
+The trade-off: a 2-minute watermark introduces 2 minutes of additional latency on every window result (the window result for [0:00–0:05] is not emitted until 0:07). This is acceptable for a dashboard that refreshes every 5 minutes. A longer watermark (e.g., 8 minutes to capture 99%) would add 8 minutes of latency to every window, making a 5-minute window dashboard show data that is always ~8–13 minutes old.
+
+**(b)** The 6-hour-late records (the 1% offline overnight) cannot be accommodated in a realtime 5-minute window without introducing 6 hours of window lag — which would make the dashboard useless. The correct architecture separates the two use cases:
+
+- **Realtime path**: Faust/Flink stream processor with 2-minute watermark. Late records (arriving after the watermark) are routed to a **side output** (a separate Kafka topic: `sensor-readings-late`).
+- **Daily summary path**: a batch job that runs at, e.g., 06:00 UTC each day, reading from both the main topic and the `sensor-readings-late` topic. It recomputes the previous day's summary using all records that have now arrived, including the 6-hour-late offline sensor data. This result is written to a separate summary table marked as "final" (as opposed to the realtime dashboard's "provisional" figures).
+
+This pattern — provisional realtime result followed by a corrected batch result — is the standard approach when data sources have highly variable arrival latency.
+
+---
+
+**5.4 — Backpressure under load**
+
+**(a)** Initial backlog: 200,000 records. Consumer processes at 1,000 records/second; producer emits at 800 records/second. Net drain rate = 1,000 − 800 = 200 records/second. Time to drain: 200,000 / 200 = **1,000 seconds ≈ 16.7 minutes**.
+
+**(b)** The maximum number of consumers that can usefully read from a 12-partition topic is **12** — one per partition. Kafka assigns each partition to exactly one consumer within a consumer group; a 13th consumer would be idle. Adding 8 consumers to the existing 4 reaches 12 total, which fully saturates the partition-to-consumer assignment. This doubles the effective consumer throughput from 4,000 to 12,000 records/second (assuming each consumer processes 1,000 records/second), reducing drain time to: 200,000 / (12,000 − 800) = 200,000 / 11,200 ≈ **18 seconds**. Yes, adding consumers helps significantly up to the partition limit.
+
+**(c)** Async processing within a consumer allows a single consumer to issue multiple concurrent processing operations without waiting for each to complete before reading the next record. This increases throughput per consumer. The risk is **offset commit ordering**: if message A is processed after message B (because B's async operation completed first), and the consumer commits B's offset before A's, a consumer restart will start from B's offset — and A will never be reprocessed, causing data loss. Mitigation: maintain an in-flight tracking structure that only advances the committed offset when all messages with lower offsets have completed; or use at-least-once semantics (commit conservatively, accept duplicate processing, deduplicate downstream). The key principle is that async throughput gains and offset management correctness are in tension and require explicit design.
+
+---
+
+## Chapter 6 — APIs and Access Patterns
+
+**6.1 — Query plan analysis**
+
+**(a)**
+
+```sql
+-- Returns all readings within 1 km of a given point.
+-- Cast to geography for metre-accurate distance on WGS84.
+-- The geography type interprets the 1000 value as metres.
+
+SELECT reading_id, recorded_at, location
+FROM sensor_readings
+WHERE ST_DWithin(location::geography, ST_GeogFromText('SRID=4326;POINT(-33.86 151.21)'), 1000);
+```
+
+**(b)**
+
+```sql
+-- Same result, using ST_Distance.
+SELECT reading_id, recorded_at, location
+FROM sensor_readings
+WHERE ST_Distance(location::geography, ST_GeogFromText('SRID=4326;POINT(-33.86 151.21)')) < 1000;
+```
+
+**(c)** `ST_DWithin` uses the GIST index; `ST_Distance` in a WHERE clause typically does not.
+
+`ST_DWithin(geom, target, distance)` is implemented in PostGIS as an index-aware operator: the planner knows it can use a GIST index to find candidates within the bounding box of the distance buffer, then refine with the exact distance calculation. The operator has a special "index support function" registered in PostgreSQL's operator class.
+
+`ST_Distance(geom, target) < 1000` is a scalar function applied to every row. The planner sees a function call on the left side of a comparison, which it cannot directly use an index for — there is no registered index support for this form. The planner treats `ST_Distance(geom, ...)` as a black box that must be evaluated for every row, producing a sequential scan.
+
+The practical lesson: always use `ST_DWithin` for distance-based spatial filtering, not `ST_Distance < threshold`. They are logically equivalent but have radically different performance characteristics.
+
+---
+
+**6.2 — Materialised view design**
+
+**(a)**
+
+```sql
+CREATE MATERIALIZED VIEW mv_incident_hotspots AS
+SELECT
+    h.cell_id,
+    h.geom                          AS cell_geom,
+    COUNT(i.incident_id)            AS incident_count_30d,
+    NOW()                           AS refreshed_at
+FROM hex_grid h
+LEFT JOIN incidents i
+    ON ST_Within(i.location, h.geom)
+    AND i.reported_at >= NOW() - INTERVAL '30 days'
+GROUP BY h.cell_id, h.geom
+ORDER BY incident_count_30d DESC;
+
+CREATE INDEX ON mv_incident_hotspots (incident_count_30d DESC);
+CREATE INDEX ON mv_incident_hotspots USING GIST (cell_geom);
+```
+
+Columns: `cell_id`, `cell_geom`, `incident_count_30d`, `refreshed_at`. The `refreshed_at` timestamp is important — clients can inspect it to determine data freshness without querying the underlying table.
+
+**(b)** Refresh frequency: every **15 minutes**, matching the underlying data update cadence. A refresh more frequent than the data update is wasted work. A refresh less frequent means the materialised view serves data older than the most recent incident update. Schedule with a cron job or pg_cron:
+
+```sql
+SELECT cron.schedule('refresh-hotspots', '*/15 * * * *',
+  'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_incident_hotspots');
+```
+
+Use `CONCURRENTLY` to avoid locking the view during refresh (requires a unique index on the view).
+
+**(c)** "As of the last 30 minutes" cannot be satisfied with a materialised view refreshed every 15 minutes. The view can be at most 15 minutes stale; showing data "as of 30 minutes" is achievable with the current architecture, but "as of the last 30 minutes" implies data no older than 30 minutes — which the view satisfies at refresh time but not between refreshes.
+
+If the requirement means "show incidents from the most recent 30-minute window and keep that window current," a materialised view with a 15-minute refresh cycle satisfies it marginally. If it means "the data in the response must never be more than 30 seconds old," a materialised view is insufficient. The minimum change: move the 30-minute window filter into the live query (`WHERE reported_at >= NOW() - INTERVAL '30 minutes'`) with a GIST index on `location` and a B-tree index on `reported_at`. Accept the higher per-request query cost in exchange for live data.
+
+---
+
+**6.3 — Pagination strategy**
+
+**(a)** Offset-based pagination cost scales with the offset value. `LIMIT 1000 OFFSET 0` requires the database to identify and return rows 1–1,000 — efficient. `LIMIT 1000 OFFSET 7999000` requires the database to scan and discard 7,999,000 rows before returning the next 1,000. For a dataset of 8 million features:
+
+- Page 1: scan ~1,000 rows. Cheap.
+- Page 8,000: scan ~8,000,000 rows, discard 7,999,000, return 1,000. 8,000× more work than page 1.
+- Total database work for the full download: sum of offsets ≈ 1,000 + 2,000 + ... + 8,000,000 = approximately **32 billion row examinations** across 8,000 requests.
+
+**(b)** Cursor-based pagination:
+
+```sql
+-- Page 1: no cursor, return first 1000 by parcel_id
+SELECT parcel_id, area_m2, lga_name, ST_AsGeoJSON(geom) AS geometry
+FROM parcels
+ORDER BY parcel_id
+LIMIT 1000;
+-- Client saves the last parcel_id from the response as the cursor.
+
+-- Next page after cursor parcel_id = 3850271:
+SELECT parcel_id, area_m2, lga_name, ST_AsGeoJSON(geom) AS geometry
+FROM parcels
+WHERE parcel_id > 3850271
+ORDER BY parcel_id
+LIMIT 1000;
+```
+
+Both queries use the B-tree index on `parcel_id` and scan only 1,000 rows regardless of which page is being fetched. Total database work for the full download: 8,000,000 row reads across 8,000 requests — linear rather than quadratic.
+
+**(c)** Cursor-based pagination on a non-unique sort column (e.g., area) presents two problems. First, ties: if multiple parcels share the same area value, the cursor position is ambiguous — some pages may return duplicate rows and others may skip rows. Second, if the sort column is not indexed, each page request requires a sort of the full result set to find the cursor position.
+
+Solutions: use a composite sort key (`ORDER BY area_m2, parcel_id`) where `parcel_id` breaks ties, and encode the cursor as `(area_m2, parcel_id)`. The `WHERE` clause becomes `WHERE (area_m2, parcel_id) > (cursor_area, cursor_id)`. This requires a composite index on `(area_m2, parcel_id)`. Without that index, each page requires a full table scan and sort — worse than offset pagination at any page number.
+
+---
+
+**6.4 — Rate limit design**
+
+**(a)** Analysis scripts are most adversely affected. A browser map viewer makes a burst of requests (3–5 tile requests per pan, then idle for seconds). At 60 requests/minute = 1 request/second average, a user who pans the map 10 times in a minute and triggers 5 tile requests per pan uses 50 requests — safely under the limit. An analysis script downloading a dataset makes sustained requests at the maximum possible rate and will be throttled immediately, extending a dataset download that should take 5 minutes into potentially hours. The flat limit is designed for interactive use and penalises programmatic bulk access most severely.
+
+**(b)** Tiered rate limit scheme:
+
+| Tier | Authentication | Requests/minute | Burst allowance |
+|---|---|---|---|
+| Unauthenticated | None | 30 | 10 (token bucket) |
+| Registered API key | API key header | 120 | 30 |
+| Bulk download key | API key with bulk role | 600 | 50 |
+
+Burst allowance uses a token bucket: a burst of 30 requests can be consumed instantly, but the bucket refills at the sustained rate. This accommodates map viewers (which burst then idle) without allowing sustained high-rate extraction by unauthenticated users. Bulk download keys are issued separately on request and have distinct monitoring — a single bulk key consuming 600 requests/minute is expected behaviour; a registered key doing the same is anomalous.
+
+**(c)** The map viewer makes 3 simultaneous tile requests per pan. If a user pans 20 times per minute, they generate 60 requests — exactly at the 60/minute limit, with no room for map initialisation or other requests. The rate limit is enforced per-client, but the client's access pattern is inherently bursty.
+
+Options that do not raise the overall limit: (i) switch to a **token bucket** rather than a sliding window counter — the bucket allows the burst of 3 simultaneous tiles to be consumed from accumulated tokens, then replenishes; the sustained rate remains the same; (ii) implement **tile-request batching** at the API level, accepting a request for multiple tiles in a single HTTP call (this counts as one request against the limit); (iii) exclude map tile endpoints from the rate limit entirely and apply the limit only to feature data endpoints, where abuse is more costly.
+
+---
+
+## Chapter 7 — Data Quality and Governance
+
+**7.1 — CRS mismatch detection**
+
+**(a)**
+
+```sql
+-- macros/tests/within_national_grid.sql
+-- Custom dbt test: fails if any row has geometry outside the BNG bounding box.
+-- BNG (EPSG:27700) extent for Great Britain:
+--   Easting:  -100,000 to 700,000 m
+--   Northing: -100,000 to 1,300,000 m
+
+{% test within_national_grid(model, column_name) %}
+
+SELECT
+    {{ column_name }} AS failing_geometry
+FROM {{ model }}
+WHERE NOT (
+    ST_X({{ column_name }}) BETWEEN -100000 AND 700000
+    AND ST_Y({{ column_name }}) BETWEEN -100000 AND 1300000
+)
+
+{% endtest %}
+```
+
+The bounding box values: BNG easting ranges from approximately −100,000 m (slightly west of the Scilly Isles) to 700,000 m (eastern Norfolk); BNG northing ranges from approximately −100,000 m (southern England) to 1,300,000 m (northern Scotland). These are in metres from the BNG false origin south of the Isles of Scilly.
+
+**(b)** WGS84 decimal degree coordinates for the UK range from longitude −8 to +2 and latitude 49 to 61. BNG coordinates range from 0 to 700,000 (easting) and 0 to 1,300,000 (northing). These ranges do not overlap numerically: the largest WGS84 value (longitude +2) is far smaller than the smallest meaningful BNG value (easting ~0 for a point on the west coast). A point incorrectly stored in WGS84 in a BNG column will have coordinates like (−2.5, 51.5) — values of −2.5 and 51.5 that fall far outside the BNG extent of [−100,000, 700,000] × [−100,000, 1,300,000]. The bounding box test is therefore a highly reliable discriminator: no valid BNG coordinate for Great Britain has easting or northing values in the range −8 to +61.
+
+**(c)** Remediation workflow: the reprojection step should be applied in the **staging model** (`stg_properties`), not in a downstream model. Staging models are the correct location for type normalisation and CRS standardisation — all downstream models should receive geometries in a single, consistent CRS. Update `stg_properties.sql` to apply `ST_Transform(geom, 27700)` to records from the affected source system, conditioned on the source system identifier. Run `dbt run --full-refresh --select stg_properties+` to re-materialise the staging model and all downstream models.
+
+Verification test: add a `within_national_grid` test to `stg_properties` in `schema.yml`. After the fix, `dbt test --select stg_properties` should pass with zero failing rows.
+
+---
+
+**7.2 — dbt schema test design**
+
+**(a)**
+
+```yaml
+# models/intermediate/schema.yml
+version: 2
+
+models:
+  - name: int_flood_risk_scores
+    description: >
+      Flood risk scores per property, joining property records to flood zone
+      polygons and vulnerability scores. One row per property.
+
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "COUNT(*) >= (SELECT COUNT(*) * 0.95 FROM {{ ref('stg_properties') }})"
+          name: row_count_at_least_95pct_of_input
+
+    columns:
+      - name: property_id
+        description: Unique property identifier.
+        tests:
+          - not_null
+          - unique
+
+      - name: flood_zone
+        description: Flood zone classification from stg_flood_zones.
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['zone_1', 'zone_2', 'zone_3a', 'zone_3b', 'unclassified']
+
+      - name: risk_score
+        description: Composite flood risk score (0–100).
+        tests:
+          - not_null
+
+      - name: property_id
+        tests:
+          - relationships:
+              to: ref('stg_properties')
+              field: property_id
+```
+
+**(b)** Failure mode for each test:
+
+- **`not_null` + `unique` on `property_id`**: detects a spatial join that fans out — if a property intersects multiple flood zones and the join does not deduplicate, the same `property_id` appears multiple times. A `not_null` failure would indicate the join introduced NULL property IDs (orphan rows from `stg_flood_zones`).
+- **`accepted_values` on `flood_zone`**: detects schema drift in `stg_flood_zones`. If a new zone classification (`'zone_4'`) is added upstream and not handled, this test fails loudly rather than silently passing malformed values to the risk score calculation.
+- **`relationships` on `property_id`**: detects rows in the output whose `property_id` does not exist in `stg_properties`. This would indicate a join logic error — properties appearing in `int_flood_risk_scores` that have no source record.
+- **Row count assertion (≥95%)**: detects a spatial join or filter that silently drops properties. The most common cause is a property geometry that does not intersect any flood zone polygon — the inner join drops it. A percentage threshold is more appropriate than an absolute count because `stg_properties` grows over time; a fixed absolute count would either become trivially satisfiable or would require manual maintenance as the dataset grows.
+
+**(c)**
+
+```yaml
+# sources/sources.yml
+sources:
+  - name: external_providers
+    schema: raw
+    tables:
+      - name: ref_vulnerability_scores
+        description: "Quarterly vulnerability scores from external data provider."
+        loaded_at_field: loaded_at
+        freshness:
+          warn_after: {count: 95, period: day}
+          error_after: {count: 110, period: day}
+```
+
+The thresholds are set at 95/110 days rather than exactly 90 days because data delivery is rarely perfectly punctual. Setting the threshold at exactly 90 days would generate spurious warnings on a quarterly update that arrives a day late. The 5-day grace period (warn after 95 days) is sufficient to notice a delayed delivery without alerting on normal variation. The error threshold at 110 days (20 days past expected) indicates the provider has missed a full quarter's delivery and the scores may be materially stale — at this point pipeline runs should fail rather than produce scores based on data that may be a full quarter out of date.
+
+---
+
+**7.3 — Governance and PII**
+
+**(a)** Classification by sensitivity:
+
+- **Raw GPS tracks with session identifiers**: **Highest sensitivity — personal data under GDPR Article 4**. GPS tracks linked to session identifiers can be used to reconstruct an individual's daily movements, home address, workplace, and social interactions. Session identifiers link to registered user accounts, making these directly personally identifiable. This data is subject to the full range of GDPR obligations: lawful basis for processing, purpose limitation, data minimisation, retention limits, and data subject rights (access, deletion, portability).
+
+- **GPS tracks with session identifiers removed, bike IDs retained**: **High sensitivity — pseudonymous personal data**. Bike IDs are stable identifiers. A fleet of 3,000 bikes over months of operation creates a dataset where recurring movement patterns for each bike_id are visible. If a bike is consistently docked near a specific address at 08:00 and 18:00, that pattern identifies the user's residence even without the session identifier. GDPR Recital 26 explicitly addresses pseudonymisation: removal of a direct identifier does not make data non-personal if re-identification is reasonably possible. This data should still be treated as personal data.
+
+- **GPS tracks aggregated to 500 m grid cells, counts per cell per hour**: **Low sensitivity — aggregate statistical data**. Provided the counts are above a minimum suppression threshold, individual journeys cannot be reconstructed from cell-level counts. This data is not personal data under GDPR and can be shared without restriction.
+
+- **User account table**: **Highest sensitivity — directly personally identifiable data**. Contains name, email, payment information, and potentially home address. Subject to strictest access controls, encryption at rest, and retention policies.
+
+**(b)** Pipeline for urban planning heatmap without individual journey retention:
+
+1. **Ingest** raw GPS tracks (personal data) into an isolated, access-controlled processing environment.
+2. **Spatial aggregation**: assign each GPS point to a 500 m H3 grid cell using `h3.geo_to_h3(lat, lng, resolution=8)`. Do not retain the original coordinates.
+3. **Temporal aggregation**: truncate timestamp to 1-hour bucket. Do not retain the original timestamp.
+4. **Count aggregation**: count points per `(cell_id, hour_bucket)`. Do not retain bike_id or session_id in the aggregated table.
+5. **Suppression**: for any cell × hour combination with fewer than **5 observations**, suppress the cell entirely (replace with NULL or exclude from output). The threshold of 5 is a common minimum for statistical disclosure control; stricter regimes use 10.
+6. **Retention policy**: raw GPS tracks and the intermediate bike_id track data must be deleted within **24 hours** of aggregation. The aggregated, suppressed heatmap may be retained indefinitely as it contains no personal data.
+
+**(c)** Access to raw GPS tracks with session identifiers for a research study could be granted under GDPR **Article 6(1)(e)** (public task) or **Article 9(2)(j)** (scientific research purpose), subject to:
+
+- **Ethical approval** from an institutional review board or equivalent.
+- **Data Processing Agreement (DPA)** between the utility and the researcher's institution, specifying permitted uses, prohibition on re-identification attempts, and data destruction obligations after the study.
+- **Data minimisation**: only provide the minimum fields necessary for the research question. If the study requires commuting patterns, supply trip-level origin-destination pairs rather than second-by-second GPS tracks.
+- **Technical safeguards**: access via a secure research environment (e.g., a controlled analytics sandbox) rather than export to the researcher's own infrastructure.
+- **Pseudonymisation in transit**: replace session identifiers with study-specific pseudonyms that cannot be reversed without the key held by the data controller.
+- The researcher may not publish results that could be used to identify individuals — standard statistical disclosure control applies to outputs.
+
+---
+
+**7.4 — Data lineage for impact analysis**
+
+**(a)** The full DAG is: `raw_os_mastermap → stg_os_mastermap → int_land_parcels → int_flood_risk_scores → fct_flood_exposure_summary`.
+
+Following an OS Mastermap geometry update, all models downstream of `raw_os_mastermap` need to be re-materialised. The correct order follows topological sort of the DAG:
+
+1. `stg_os_mastermap` (reads directly from `raw_os_mastermap`)
+2. `int_land_parcels` (depends on `stg_os_mastermap`)
+3. `int_flood_risk_scores` (depends on `int_land_parcels`)
+4. `fct_flood_exposure_summary` (depends on `int_flood_risk_scores`)
+
+Order matters because each model reads from its upstream dependency. Running `int_land_parcels` before `stg_os_mastermap` is rebuilt would process stale staging data. Running `fct_flood_exposure_summary` before `int_flood_risk_scores` would produce the final summary from stale risk scores. dbt enforces this automatically via `dbt run --select raw_os_mastermap+` (the `+` selects all downstream models).
+
+**(b)** Investigation process for the 3,200-row drop in `int_flood_risk_scores`:
+
+1. **Check `stg_os_mastermap`**: compare row count before and after the update. If `stg_os_mastermap` has 15,000 fewer rows, the updated OS data dropped those parcels from the source — they may have been merged, reclassified, or are genuinely absent from the new release. If `stg_os_mastermap` has the same row count, the drop happened in a downstream transformation.
+
+2. **Check `int_land_parcels`**: compare row count against `stg_os_mastermap`. If `int_land_parcels` has 3,200 fewer rows than `stg_os_mastermap`, a filter or join in `int_land_parcels` dropped them — likely because the geometry change caused parcels to fail a validity check or spatial predicate.
+
+3. **Check `int_flood_risk_scores`**: if `int_land_parcels` has the same row count as before but `int_flood_risk_scores` dropped 3,200 rows, the coastal geometry update caused those parcels to no longer intersect any flood zone polygon — the spatial join between `int_land_parcels` and the flood zones returned no match for 3,200 coastal parcels. This would be the expected outcome of a beach erosion re-survey: parcels that were previously inland are now seaward of the coastline and no longer intersect the terrestrial flood zone layer.
+
+**(c)** Updated DAG:
+
+```
+raw_os_mastermap ──────────────────┐
+                                   ▼
+raw_environment_agency_flood_zones ──► int_flood_risk_scores ──► fct_flood_exposure_summary
+                                   ▲
+stg_os_mastermap → int_land_parcels
+```
+
+`int_flood_risk_scores` now has two upstream sources with different update schedules: OS Mastermap (6-month release cycle) and Environment Agency flood zones (update schedule to be determined — typically annual or event-driven). The additional governance consideration: **temporal consistency**. When two sources are updated on different schedules, a pipeline run may combine a new OS Mastermap geometry release with 8-month-old flood zone polygons, or vice versa. The risk score is a function of both inputs; using a new coastline against old flood zone boundaries produces results that are internally inconsistent. The governance response: document the vintage of each source in the model's metadata and the catalogue entry; set up dbt source freshness checks on both sources so the pipeline fails if either source is stale beyond its expected update window; and consider whether the model should be blocked from running when source vintages are mismatched by more than a defined threshold.
+
+---
+
+## Chapter 8 — Platform Architecture for ML
+
+**8.1 — Training/serving skew diagnosis**
+
+**(a)** The centroid and zonal mean extraction methods produce different feature values for every grid cell that contains spatial heterogeneity. For elevation: a 1 km² cell in mountainous terrain may have a centroid elevation of 450 m but a zonal mean elevation of 380 m (if the cell includes a valley). The model was trained on centroid values, so its decision boundaries were calibrated to centroid-level feature distributions. At serving time, it receives zonal mean values — a different distribution. Features where the terrain or vegetation is highly variable within a 1 km² cell will show the largest shift.
+
+The shift is largest for: complex terrain with high within-cell variance (mountain foothills, valley edges, forest–meadow interfaces); cells at the boundaries of habitat zones where the centroid falls in one habitat type but the mean is influenced by both. The shift is negligible for: flat terrain with homogeneous land cover; cells that are internally uniform (e.g., an agricultural monoculture or an open water body).
+
+**(b)** Pre-deployment skew test: for a held-out set of grid cells (not used in training), compute features using both methods (centroid and zonal mean). Compare the distributions of each feature across the two extraction methods using a two-sample Kolmogorov–Smirnov (KS) test or the Population Stability Index (PSI). If the PSI for any feature exceeds 0.1 (minor shift) or 0.2 (major shift), flag the feature and require investigation before deployment. As a stronger test, train a binary classifier to distinguish centroid-extracted features from zonal-mean-extracted features for the same cells; if AUC > 0.6, the distributions are distinguishable and the skew is operationally relevant.
+
+**(c)** Option (i) — update serving to use centroid extraction — is the lower-cost immediate fix: it requires changing one function in the serving pipeline and does not require model retraining. The model's internal calibration remains valid because it was trained on centroid features and now receives centroid features. The downside: centroid extraction may be less representative than zonal mean for cells with complex landscapes, so the model's ecological validity may be limited even after the fix.
+
+Option (ii) — retrain both pipelines to use zonal mean — is the higher-quality long-term solution. Zonal mean is more representative of the habitat available to birds throughout the cell, not just at the centroid. However, it requires: updating both pipelines, retraining the model from scratch (losing any hyperparameter tuning and experimentation history), re-evaluating the model, and re-deploying. The AUC difference (0.87 vs 0.71 in production) suggests the model is significantly degraded, so the retraining cost is justified. Option (i) is the correct emergency fix; option (ii) is the correct strategic response.
+
+---
+
+**8.2 — Feature store design**
+
+**(a)**
+
+```python
+from datetime import timedelta
+from feast import Entity, FeatureView, Field, FileSource, ValueType
+from feast.types import Float32, Int32
+
+coa = Entity(
+    name="coa_code",
+    value_type=ValueType.STRING,
+    description="Census Output Area code",
+)
+
+# Feature view 1: air quality (NO2 from DEFRA)
+# Spatial operation: spatial join of DEFRA station monitoring points
+# to COA polygons using inverse-distance weighted interpolation.
+no2_source = FileSource(
+    path="data/features/no2_annual.parquet",
+    timestamp_field="reference_year_start",
+)
+
+no2_features = FeatureView(
+    name="no2_features",
+    entities=[coa],
+    ttl=timedelta(days=400),  # Updated annually; 400 days allows slight delay
+    schema=[
+        Field(name="mean_no2_ug_m3", dtype=Float32),
+        Field(name="no2_percentile_national", dtype=Float32),
+    ],
+    source=no2_source,
+)
+
+# Feature view 2: industrial proximity
+# Spatial operation: ST_Distance from each COA centroid to nearest industrial site.
+industrial_source = FileSource(
+    path="data/features/industrial_proximity.parquet",
+    timestamp_field="computed_at",
+)
+
+industrial_features = FeatureView(
+    name="industrial_features",
+    entities=[coa],
+    ttl=timedelta(days=100),  # Updated quarterly; 100-day TTL covers the quarter
+    schema=[
+        Field(name="dist_nearest_industrial_m", dtype=Float32),
+        Field(name="industrial_site_count_1km", dtype=Int32),
+    ],
+    source=industrial_source,
+)
+
+# Feature view 3: census demographics
+# Spatial operation: direct join from census COA table (no geometry operation needed).
+census_source = FileSource(
+    path="data/features/census_demographics.parquet",
+    timestamp_field="census_year",
+)
+
+census_features = FeatureView(
+    name="census_features",
+    entities=[coa],
+    ttl=timedelta(days=3653),  # 10-year census cycle; TTL covers the full decade
+    schema=[
+        Field(name="residential_density_per_ha", dtype=Float32),
+        Field(name="pct_elderly_residents", dtype=Float32),
+    ],
+    source=census_source,
+)
+```
+
+**(b)** When a COA's features are older than their TTL, Feast returns NULL for those features at online retrieval time. This would cause the risk score model to receive NULL inputs, which most models handle poorly (either crashing or producing a default/fallback score that may be misleading).
+
+The TTL mismatch creates a practical risk: if NO₂ data is updated annually but industrial site locations are updated quarterly, a COA's NO₂ features may expire before the next annual update if the delivery is late. Setting TTL to 400 days (rather than exactly 365) provides a grace period. The 10-year census TTL is effectively a permanent cache — census data does not become stale until the next census. For an annual risk score that runs batch inference, it is more robust to use point-in-time correct retrieval (as in the offline store) rather than TTL-based expiry: retrieve features as-of the scoring date and accept that census features from 2021 represent 2021 demographics for 2023 scores, with that vintage documented in the model card.
+
+**(c)** Point-in-time correct feature retrieval ensures that the feature value used for a historical entity-timestamp pair is the value that was available at that timestamp — not a later updated value. For the air quality study (2015–2023): NO₂ values changed year by year; industrial site inventories changed quarterly; census demographics changed at the 2011 and 2021 censuses. If current feature values (2023 NO₂, 2023 industrial sites, 2021 census) are used for all historical entity-timestamp pairs, the model learns the relationship between 2023 features and hospital admissions recorded in 2015 — a nonsensical training signal. The 2015 admissions were determined by 2015 NO₂ concentrations and 2015 industrial geography.
+
+Using current feature values for historical training produces **data leakage from the future**: the model is given information that was not available at the time of the outcome it is trying to predict. The result is a model that appears to perform well in offline evaluation (because the training data is coherent with the test data, which also uses current features) but performs poorly or unpredictably when applied prospectively, because the future feature values it was trained on do not exist at inference time.
+
+---
+
+**8.3 — MLflow model registry**
+
+**(a)** Promotion workflow for version 5 (candidate → Staging):
+
+- Automated evaluation on a held-out validation set: AUC, precision/recall at top decile, and calibration (Brier score). **Spatial metric**: recall stratified by geographic stratum — the model must not show large performance gaps between regions (e.g., performing well on urban-fringe fires but poorly on remote fires).
+- Comparison against version 3 (current Production) on the same validation set: version 5 must meet or exceed version 3's performance on all primary metrics.
+- Feature drift check: compare the feature distributions in version 5's training data against version 3's. If the distributions have shifted significantly, document the reason.
+- If all checks pass, tag version 5 as `Staging` in the registry.
+
+Promotion from Staging to Production:
+
+- Run version 4 (current Staging) and version 5 in **shadow mode**: version 3 serves production predictions; versions 4 and 5 generate shadow predictions on the same inputs. Compare shadow predictions against version 3 and against each other over 1–2 weeks of production traffic.
+- Regional performance audit: version 5 must not regress performance in any individual geographic stratum by more than a defined tolerance (e.g., 0.03 AUC, 0.05 precision at top decile).
+- Operational readiness: confirm that version 5's inference latency and memory footprint are within the serving infrastructure's thresholds.
+
+**(b)** With version 4's AUC improving (0.88 vs 0.86) but top-decile precision declining (0.74 vs 0.79): **do not promote version 4 to Production**. The AUC improvement is aggregate and does not reflect the operationally critical high-confidence predictions. Fire crews respond to top-decile alerts; a 6.3% decline in top-decile precision means more false alarms per deployment. The operational cost of false alarms (crew deployment, fatigue, resource exhaustion) likely outweighs the benefit of marginally better average discrimination.
+
+Registry documentation: record version 4 in Staging with a note: `"Promotion declined. AUC: 0.88 (+0.02 vs v3). Top-decile precision: 0.74 (-0.05 vs v3). Held in Staging pending investigation of precision regression. Version 3 remains Production."` This creates an auditable record of the decision and its rationale, preserving the context for whoever investigates the precision regression.
+
+**(c)** MLflow's parameter logging helps if the spatial join method was logged as a parameter on every training run. For example: `mlflow.log_param("spatial_join_method", "centroid_extract")`. If this parameter was logged, comparing versions 3, 4, and 5 in the MLflow UI would immediately reveal the discrepancy — version 3 would show `spatial_join_method: centroid_extract` and versions 4 and 5 would show something different.
+
+If the parameter was not logged, MLflow's run history is unhelpful for this specific investigation: it will show metrics, dataset paths, and model hyperparameters, but the spatial join method is a pipeline configuration that exists outside the model training code unless explicitly instrumented. The investigation must then trace the training code in version control — finding the git commit hash for each training run (which MLflow should log via `mlflow.set_tag("git_commit", ...)`) and diffing the feature extraction code.
+
+The parameter that should have been logged in every training run: `spatial_join_method` (or more specifically, the name of the feature extraction function or configuration class). Any aspect of the feature engineering that could vary between runs should be logged as a parameter — not because it affects the model weights directly, but because it affects what the model weights mean.
+
+---
+
+**8.4 — Batch vs online inference**
+
+**(a)** Two limitations of weekly batch inference for pipe burst prediction:
+
+1. **Temporal staleness of risk scores**: a pipe whose risk changes during the week (because road works begin adjacent to it on Monday) will not have an updated risk score until the next weekly batch on Sunday. If a burst occurs on Wednesday, the maintenance scheduling system had no signal that the risk had increased.
+
+2. **No response to operational events**: road works, unusual weather, or a nearby burst that increases pressure on adjacent pipes are operational events that change burst probability in near real time. Weekly batch inference treats the pipe network as static between runs. In practice, the risk landscape is dynamic: a burst in segment A increases hydraulic stress on segments B and C immediately.
+
+Operational harm scenario: road works are scheduled to begin on Tuesday at a location 50 metres from a high-age cast-iron main. A weekly batch run on Sunday assessed the pipe's risk without road works proximity. The road works commence; vibration and ground movement increase burst probability significantly. The maintenance scheduler sees no signal because the feature value (distance to road works) has changed but the risk score has not been updated. The pipe bursts on Thursday. With daily batch inference, the updated road works location would have been incorporated in Tuesday's scoring run.
+
+**(b)** Changes required for daily batch inference:
+
+- **Feature store**: materialise road works proximity, recent pressure readings, and any other time-sensitive features on a daily schedule. The offline store's materialisation job must run before the inference pipeline.
+- **Inference pipeline**: change the Prefect/Airflow schedule from weekly to daily. The pipeline reads from the feature store as-of the previous day's materialisation timestamp.
+- **Monitoring**: tighten alert thresholds. With weekly inference, a risk threshold of 0.8 alerts on genuinely high-risk pipes. With daily inference and more current features, the score distribution may shift — thresholds calibrated on weekly scores may generate too many or too few alerts. Re-calibrate thresholds using daily score distributions from a back-test.
+
+Primary engineering cost: the feature materialisation pipeline must run reliably every day rather than every week. This increases operational burden (7× more runs to monitor, debug, and maintain) and may expose edge cases in the feature engineering that weekly runs never triggered (e.g., days with no road works data from the local authority API).
+
+**(c)** The road works use case — generating an updated burst probability when road works are planned near a pipe — requires **online inference** if the latency requirement is under a few minutes (e.g., a planner is entering road works data and expects an updated risk assessment before they submit the works order). It can be served with more frequent batch inference if the latency requirement is, say, same-day.
+
+| Dimension | Online inference | More frequent batch (hourly) |
+|---|---|---|
+| Latency requirement | Sub-minute | Up to 1 hour |
+| Feature freshness | Real-time (road works entered seconds ago) | Within the last hour |
+| Infrastructure | Online feature store (Redis/DynamoDB), model server (e.g., BentoML), low-latency API endpoint | Same batch pipeline scheduled more frequently; no additional serving infrastructure |
+| Engineering cost | High: requires online store materialisation, model serving API, latency monitoring | Moderate: increases batch scheduling frequency, adds scheduling and monitoring overhead |
+
+For the specific use case described — works planned, not started — the planner likely does not need a sub-minute response. Hourly batch inference (scoring all pipe segments within 1 km of newly entered road works) would satisfy the requirement at substantially lower infrastructure cost. Online inference is warranted only if the latency requirement is strict and the use case involves real-time interaction.

@@ -1,0 +1,63 @@
+project:
+  type: book
+  output-dir: _site
+  resources:
+    - assets/
+
+book:
+  title: "Data Engineering for Spatial Systems"
+  subtitle: "Databases, pipelines, and platforms for earth and place data at scale"
+  date: last-modified
+  search: true
+  page-navigation: true
+  repo-url: https://github.com/WaywardHouse/waywardhouse-data-engineering
+  repo-actions: [edit, issue]
+  sharing: [twitter, linkedin]
+  sidebar:
+    style: docked
+    search: true
+    collapse-level: 1
+    tools:
+      - icon: house
+        href: /
+        aria-label: Wayward House
+      - icon: grid
+        href: /learn/
+        aria-label: Learn
+      - icon: github
+        href: https://github.com/WaywardHouse/waywardhouse-data-engineering
+        aria-label: Repository
+  chapters:
+    - index.qmd
+    - 01-data-architecture.qmd
+    - 02-spatial-databases.qmd
+    - 03-pipelines-and-etl.qmd
+    - 04-cloud-infrastructure.qmd
+    - 05-streaming-and-realtime.qmd
+    - 06-apis-and-access-patterns.qmd
+    - 07-data-quality-and-governance.qmd
+    - 08-platform-architecture-for-ml.qmd
+    - 09-exercise-answers.qmd
+
+bibliography: references.bib
+
+format:
+  html:
+    css:
+      - _extensions/wayward-book/wayward-book.css
+      - lightbox.css
+    include-in-header: _extensions/wayward-book/head.html
+    include-after-body: _include/after-body.html
+    smooth-scroll: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-align: center
+    fig-width: 8
+    fig-height: 4
+    callout-appearance: simple
+    code-fold: true
+    html-math-method: katex
+
+execute:
+  freeze: auto

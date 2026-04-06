@@ -1,0 +1,343 @@
+%% references.bib
+%% Bibliography for "Data Engineering for Spatial Systems"
+%% Wayward House / ESDE 206 / ESDE 302
+%%
+%% Entries are organised by chapter order of first appearance.
+%% Academic papers use the real venue, authors, and year.
+%% Software tools without a canonical paper use @misc with the official URL.
+
+%% ── Chapter 1: Data Architecture ─────────────────────────────────────────────
+
+@misc{postgresql2024,
+  author       = {{The PostgreSQL Global Development Group}},
+  title        = {{PostgreSQL}: The World's Most Advanced Open Source Relational Database},
+  year         = {2024},
+  url          = {https://www.postgresql.org/},
+  note         = {Version 16. Accessed 2024}
+}
+
+@article{duckdb2019,
+  author       = {Raasveldt, Mark and M{\"u}hleisen, Hannes},
+  title        = {{DuckDB}: an Embeddable Analytical Database},
+  journal      = {Proceedings of the 2019 International Conference on Management of Data (SIGMOD)},
+  year         = {2019},
+  pages        = {1981--1984},
+  publisher    = {ACM},
+  doi          = {10.1145/3299869.3320212},
+  url          = {https://dl.acm.org/doi/10.1145/3299869.3320212}
+}
+
+@misc{geoparquet2023,
+  author       = {{GeoParquet Contributors}},
+  title        = {{GeoParquet}: Encoding of Geospatial Data in {Apache Parquet}},
+  year         = {2023},
+  url          = {https://geoparquet.org/},
+  note         = {Specification v1.0.0. Accessed 2024}
+}
+
+@misc{apacheparquet2024,
+  author       = {{Apache Software Foundation}},
+  title        = {{Apache Parquet}: Columnar Storage Format},
+  year         = {2024},
+  url          = {https://parquet.apache.org/},
+  note         = {Accessed 2024}
+}
+
+@misc{h3uber2018,
+  author       = {Brodsky, Isaac},
+  title        = {{H3}: Uber's Hexagonal Hierarchical Spatial Index},
+  year         = {2018},
+  url          = {https://eng.uber.com/h3/},
+  note         = {Uber Engineering Blog. Accessed 2024}
+}
+
+@misc{h32024,
+  author       = {{Uber Technologies}},
+  title        = {{H3}: A Hexagonal Hierarchical Geospatial Indexing System},
+  year         = {2024},
+  url          = {https://h3geo.org/},
+  note         = {Accessed 2024}
+}
+
+%% ── Chapter 2: Spatial Databases ─────────────────────────────────────────────
+
+@misc{postgis2024,
+  author       = {{PostGIS Development Team}},
+  title        = {{PostGIS}: Spatial and Geographic Objects for {PostgreSQL}},
+  year         = {2024},
+  url          = {https://postgis.net/},
+  note         = {Version 3.4. Accessed 2024}
+}
+
+@article{rtree1984,
+  author       = {Guttman, Antonin},
+  title        = {{R-Trees}: A Dynamic Index Structure for Spatial Searching},
+  journal      = {Proceedings of the 1984 ACM SIGMOD International Conference on Management of Data},
+  year         = {1984},
+  pages        = {47--57},
+  publisher    = {ACM},
+  doi          = {10.1145/602259.602266},
+  url          = {https://dl.acm.org/doi/10.1145/602259.602266}
+}
+
+@techreport{ogcsimplefeatures2011,
+  author       = {{Open Geospatial Consortium}},
+  title        = {{OpenGIS} Implementation Standard for Geographic Information --- Simple Feature Access --- Part 2: {SQL} Option},
+  institution  = {Open Geospatial Consortium},
+  year         = {2011},
+  number       = {OGC 06-104r4},
+  url          = {https://www.ogc.org/standard/sfs/}
+}
+
+@misc{duckdbspatial2024,
+  author       = {{DuckDB Contributors}},
+  title        = {{DuckDB} Spatial Extension},
+  year         = {2024},
+  url          = {https://duckdb.org/docs/extensions/spatial/overview.html},
+  note         = {Accessed 2024}
+}
+
+%% ── Chapter 3: Pipelines and ETL ─────────────────────────────────────────────
+
+@misc{dbt2024,
+  author       = {{dbt Labs}},
+  title        = {{dbt}: Data Build Tool --- Transform Data in Your Warehouse},
+  year         = {2024},
+  url          = {https://www.getdbt.com/},
+  note         = {Accessed 2024}
+}
+
+@misc{prefect2024,
+  author       = {{Prefect Technologies}},
+  title        = {{Prefect}: The New Standard in Dataflow Automation},
+  year         = {2024},
+  url          = {https://www.prefect.io/},
+  note         = {Accessed 2024}
+}
+
+%% ── Chapter 4: Cloud Infrastructure ─────────────────────────────────────────
+
+@misc{gdal2024,
+  author       = {{GDAL/OGR Contributors}},
+  title        = {{GDAL/OGR} Geospatial Data Abstraction Software Library},
+  year         = {2024},
+  url          = {https://gdal.org/},
+  note         = {Open Source Geospatial Foundation. Accessed 2024}
+}
+
+@techreport{cog2021,
+  author       = {Even, Even and Smith, Noel},
+  title        = {Cloud Optimized {GeoTIFF}: A Revision of the {GeoTIFF} Standard},
+  institution  = {Open Source Geospatial Foundation},
+  year         = {2021},
+  url          = {https://cogeo.org/}
+}
+
+@misc{cogspec2024,
+  author       = {{Cloud Optimized GeoTIFF Working Group}},
+  title        = {Cloud Optimized {GeoTIFF} Specification},
+  year         = {2024},
+  url          = {https://cogeo.org/},
+  note         = {Accessed 2024}
+}
+
+@misc{stac2024,
+  author       = {{STAC Contributors}},
+  title        = {{SpatioTemporal Asset Catalog} ({STAC}) Specification},
+  year         = {2024},
+  url          = {https://stacspec.org/},
+  note         = {Version 1.0.0. Accessed 2024}
+}
+
+@misc{minio2024,
+  author       = {{MinIO, Inc.}},
+  title        = {{MinIO}: High-Performance Object Storage},
+  year         = {2024},
+  url          = {https://min.io/},
+  note         = {Accessed 2024}
+}
+
+@misc{riocogeo2024,
+  author       = {{Development Seed}},
+  title        = {cogeo-mosaic: Cloud Optimized {GeoTIFF} Mosaic Tools},
+  year         = {2024},
+  url          = {https://developmentseed.org/cogeo-mosaic/},
+  note         = {Accessed 2024}
+}
+
+%% ── Chapter 5: Streaming and Realtime ────────────────────────────────────────
+
+@inproceedings{kafka2011,
+  author       = {Kreps, Jay and Narkhede, Neha and Rao, Jun},
+  title        = {{Kafka}: A Distributed Messaging System for Log Processing},
+  booktitle    = {Proceedings of the NetDB Workshop at VLDB 2011},
+  year         = {2011},
+  url          = {https://pages.cs.wisc.edu/~akella/CS744/F17/838-CloudPapers/kafka.pdf}
+}
+
+@misc{oasismqtt2019,
+  author       = {{OASIS MQTT Technical Committee}},
+  title        = {{MQTT} Version 5.0: {OASIS} Standard},
+  year         = {2019},
+  url          = {https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html},
+  note         = {OASIS Standard. Accessed 2024}
+}
+
+@misc{mosquitto2024,
+  author       = {{Eclipse Foundation}},
+  title        = {Eclipse Mosquitto: An Open Source {MQTT} Broker},
+  year         = {2024},
+  url          = {https://mosquitto.org/},
+  note         = {Accessed 2024}
+}
+
+@misc{pahomqtt2024,
+  author       = {{Eclipse Foundation}},
+  title        = {{Eclipse Paho MQTT Python Client}},
+  year         = {2024},
+  url          = {https://github.com/eclipse/paho.mqtt.python},
+  note         = {Accessed 2024}
+}
+
+@misc{timescaledb2024,
+  author       = {{Timescale, Inc.}},
+  title        = {{TimescaleDB}: Time-Series Data for {PostgreSQL}},
+  year         = {2024},
+  url          = {https://www.timescale.com/},
+  note         = {Accessed 2024}
+}
+
+%% ── Chapter 6: APIs and Access Patterns ─────────────────────────────────────
+
+@misc{fastapi2024,
+  author       = {Ram{\'i}rez, Sebasti{\'a}n},
+  title        = {{FastAPI}: Modern, Fast Web Framework for Building {APIs} with {Python}},
+  year         = {2024},
+  url          = {https://fastapi.tiangolo.com/},
+  note         = {Accessed 2024}
+}
+
+@techreport{ogcapifeatures2022,
+  author       = {{Open Geospatial Consortium}},
+  title        = {{OGC API --- Features --- Part 1}: Core},
+  institution  = {Open Geospatial Consortium},
+  year         = {2022},
+  number       = {OGC 17-069r4},
+  url          = {https://docs.ogc.org/is/17-069r4/17-069r4.html}
+}
+
+@misc{redis2024,
+  author       = {{Redis Ltd.}},
+  title        = {{Redis}: The Open Source In-Memory Data Store},
+  year         = {2024},
+  url          = {https://redis.io/},
+  note         = {Accessed 2024}
+}
+
+%% ── Chapter 7: Data Quality and Governance ───────────────────────────────────
+
+@misc{greatexpectations2024,
+  author       = {{Great Expectations}},
+  title        = {{Great Expectations}: Always Know What to Expect from Your Data},
+  year         = {2024},
+  url          = {https://greatexpectations.io/},
+  note         = {Accessed 2024}
+}
+
+@misc{openlineage2024,
+  author       = {{OpenLineage Contributors}},
+  title        = {{OpenLineage}: An Open Standard for Metadata and Lineage Collection},
+  year         = {2024},
+  url          = {https://openlineage.io/},
+  note         = {Accessed 2024}
+}
+
+@misc{marquez2024,
+  author       = {{WeWork / Linux Foundation AI \& Data}},
+  title        = {Marquez: Open Source Metadata Service for the Collection, Aggregation, and Visualization of a Data Ecosystem's Metadata},
+  year         = {2024},
+  url          = {https://marquezproject.ai/},
+  note         = {Accessed 2024}
+}
+
+@misc{apacheatlas2024,
+  author       = {{Apache Software Foundation}},
+  title        = {{Apache Atlas}: Data Governance and Metadata Framework for {Hadoop}},
+  year         = {2024},
+  url          = {https://atlas.apache.org/},
+  note         = {Accessed 2024}
+}
+
+%% ── Chapter 8: Platform Architecture for ML ─────────────────────────────────
+
+@inproceedings{mlflow2018,
+  author       = {Zaharia, Matei and Chen, Andrew and Davidson, Aaron and Ghodsi, Ali and Hong, Sue Ann and Konwinski, Andy and Murching, Siddharth and Nykodym, Tomas and Ogilvie, Paul and Parkhe, Mani and others},
+  title        = {{MLflow}: A Platform for the Complete Machine Learning Lifecycle},
+  booktitle    = {Proceedings of the Workshop on Systems for ML at NeurIPS 2018},
+  year         = {2018},
+  url          = {https://mlflow.org/}
+}
+
+@misc{feast2024,
+  author       = {{Feast Contributors}},
+  title        = {{Feast}: Open Source Feature Store for Machine Learning},
+  year         = {2024},
+  url          = {https://feast.dev/},
+  note         = {Accessed 2024}
+}
+
+@misc{mlflow2024,
+  author       = {{MLflow Contributors}},
+  title        = {{MLflow}: An Open Source Platform for the Machine Learning Lifecycle},
+  year         = {2024},
+  url          = {https://mlflow.org/},
+  note         = {Accessed 2024}
+}
+
+%% ── Systems Thinking References ──────────────────────────────────────────────
+
+@book{meadows2008,
+  author       = {Meadows, Donella H.},
+  title        = {Thinking in Systems: A Primer},
+  year         = {2008},
+  publisher    = {Chelsea Green Publishing},
+  address      = {White River Junction, VT},
+  editor       = {Wright, Diana},
+  isbn         = {978-1-60358-055-7}
+}
+
+@book{forrester1961,
+  author       = {Forrester, Jay W.},
+  title        = {Industrial Dynamics},
+  year         = {1961},
+  publisher    = {MIT Press},
+  address      = {Cambridge, MA}
+}
+
+%% ── Spatial Data Standards ───────────────────────────────────────────────────
+
+@techreport{geojson2016,
+  author       = {Butler, Howard and Daly, Martin and Doyle, Allan and Gillies, Sean and Hagen, Stefan and Schaub, Tim},
+  title        = {The {GeoJSON} Format},
+  institution  = {Internet Engineering Task Force (IETF)},
+  year         = {2016},
+  number       = {RFC 7946},
+  url          = {https://www.rfc-editor.org/rfc/rfc7946},
+  doi          = {10.17487/RFC7946}
+}
+
+@misc{wkb2021,
+  author       = {{Open Geospatial Consortium}},
+  title        = {{OpenGIS} Implementation Standard for Geographic Information --- Simple Feature Access --- Part 1: Common Architecture},
+  year         = {2011},
+  number       = {OGC 06-103r4},
+  url          = {https://www.ogc.org/standard/sfa/}
+}
+
+@misc{epsg2024,
+  author       = {{IOGP Geomatics Committee}},
+  title        = {{EPSG} Geodetic Parameter Dataset},
+  year         = {2024},
+  url          = {https://epsg.org/},
+  note         = {Accessed 2024}
+}

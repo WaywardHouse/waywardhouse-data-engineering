@@ -1,0 +1,45 @@
+# Requires secret: WAYWARD_PUBLISH_TOKEN
+# PAT needs write access to waywardhouse/waywardhouse.github.io
+# Target URL: wayward.house/learn/data-engineering/
+
+name: Publish Data Engineering Book
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install numpy matplotlib
+
+      - name: Set up Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+
+      - name: Render book
+        uses: quarto-dev/quarto-actions/render@v2
+
+      - name: Deploy to waywardhouse.github.io/learn/data-engineering
+        uses: cpina/github-action-push-to-another-repository@55306faa4ed53b815ae49e564af8cfb359d32ae2
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.WAYWARD_PUBLISH_TOKEN }}
+        with:
+          source-directory: '_site'
+          destination-github-username: 'waywardhouse'
+          destination-repository-name: 'waywardhouse.github.io'
+          target-directory: 'learn/data-engineering'
+          user-email: github-actions@github.com
+          target-branch: main
+          arguments: --exclude=articles/ --exclude=learn/computational-geography/ --exclude=learn/maths/ --exclude=learn/systems-thinking/ --exclude=learn/data-ai/ --exclude=assets/ --exclude=CNAME
