@@ -43,11 +43,7 @@ bibliography: references.bib
 
 format:
   html:
-    css:
-      - _extensions/wayward-book/wayward-book.css
-      - lightbox.css
-    include-in-header: _extensions/wayward-book/head.html
-    include-after-body: _include/after-body.html
+    theme: cosmo
     smooth-scroll: true
     toc: true
     toc-depth: 3
