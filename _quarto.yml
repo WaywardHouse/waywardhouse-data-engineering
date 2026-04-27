@@ -42,18 +42,11 @@ book:
 bibliography: references.bib
 
 format:
-  html:
-    theme: cosmo
-    smooth-scroll: true
-    toc: true
-    toc-depth: 3
+  WaywardHouse/waywardhouse-book-html:
     number-sections: true
-    fig-align: center
     fig-width: 8
     fig-height: 4
-    callout-appearance: simple
     code-fold: true
-    html-math-method: katex
 
 execute:
   freeze: auto
